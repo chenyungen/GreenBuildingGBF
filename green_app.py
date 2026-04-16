@@ -81,6 +81,11 @@ def get_app_dir():
 
 APP_DIR = get_app_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
+# Fallback: check parent directory (for when EXE is in dist/ subfolder)
+if not os.path.exists(CONFIG_PATH):
+    _parent = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
+    if os.path.exists(_parent):
+        CONFIG_PATH = _parent
 
 DEFAULT_CONFIG = {
     "office": {
