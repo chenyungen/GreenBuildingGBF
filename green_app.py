@@ -321,6 +321,110 @@ def extract_windows(blocks, texts):
     return counts
 
 
+def extract_window_dimensions(texts):
+    """從門窗表附近的尺寸標註（例如 '280x180'、'104x210(arch)'，單位 cm）
+    推斷每個窗型的實際寬高。
+
+    流程：
+    1. 辨識門窗表群組（窗號只出現 1 次的 Y-cluster）
+    2. 蒐集附近符合尺寸格式的文字
+    3. 逐一配對：每個窗號找最靠近的尺寸文字
+    4. 未配對成功的窗型，用同系列（W/S）數字相近的窗型尺寸 fallback
+
+    回傳 dict：{window_no: (width_m, height_m)}
+    """
+    wno_re = re.compile(r"^(W\d+|S\d+|DW\d+)$")
+    dim_re = re.compile(r"^(\d{3,4})\s*[xX×*]\s*(\d{3,4})")
+
+    # Step 1: Locate schedule cluster (window numbers that each appear once)
+    all_wins = [{"wno": t["text"].strip(), "x": t["x"], "y": t["y"]}
+                for t in texts if wno_re.match(t["text"].strip())]
+    if not all_wins:
+        return {}
+    all_wins.sort(key=lambda w: w["y"])
+
+    y_clusters = []
+    cur = [all_wins[0]]
+    for w in all_wins[1:]:
+        if w["y"] - cur[-1]["y"] > 2000:
+            y_clusters.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+    y_clusters.append(cur)
+
+    schedule = None
+    for cl in y_clusters:
+        counts = {}
+        for w in cl:
+            counts[w["wno"]] = counts.get(w["wno"], 0) + 1
+        if max(counts.values()) == 1 and len(cl) > 10:
+            schedule = cl
+            break
+    if not schedule:
+        return {}
+
+    # Step 2: Collect dim candidates near the schedule region
+    sx_min = min(w["x"] for w in schedule) - 2000
+    sx_max = max(w["x"] for w in schedule) + 8000
+    sy_min = min(w["y"] for w in schedule) - 3000
+    sy_max = max(w["y"] for w in schedule) + 5000
+
+    dims = []
+    for t in texts:
+        txt = t["text"].strip()
+        m = dim_re.match(txt)
+        if m and sx_min < t["x"] < sx_max and sy_min < t["y"] < sy_max:
+            dims.append({
+                "w": int(m.group(1)),
+                "h": int(m.group(2)),
+                "x": t["x"],
+                "y": t["y"],
+            })
+
+    # Step 3: Greedy nearest-match each window to unique dim
+    result = {}
+    used_dims = set()
+    for win in sorted(schedule, key=lambda w: (w["y"], w["x"])):
+        best = None
+        best_dist = 1e18
+        for idx, d in enumerate(dims):
+            if idx in used_dims:
+                continue
+            dx = abs(d["x"] - win["x"])
+            dy = abs(d["y"] - win["y"])
+            if dx > 400 or dy > 300:
+                continue
+            dist = dx + dy
+            if dist < best_dist:
+                best_dist = dist
+                best = (idx, d)
+        if best:
+            idx, d = best
+            used_dims.add(idx)
+            result[win["wno"]] = (d["w"] / 100.0, d["h"] / 100.0)
+
+    # Step 4: Fallback for unmatched windows — use nearest numbered sibling
+    series_re = re.compile(r"^([A-Z]+)(\d+)$")
+    for win in schedule:
+        if win["wno"] in result:
+            continue
+        m = series_re.match(win["wno"])
+        if not m:
+            continue
+        prefix, num = m.group(1), int(m.group(2))
+        for step in range(1, 30):
+            for candidate_num in (num - step, num + step):
+                key = f"{prefix}{candidate_num}"
+                if key in result:
+                    result[win["wno"]] = result[key]
+                    break
+            if win["wno"] in result:
+                break
+
+    return result
+
+
 def extract_plants(texts):
     plants = []
     target = [t for t in texts if t["layer"] == "2-戶外地坪"]
@@ -591,7 +695,7 @@ def make_window_grid_entry(direction, floor, wno, quantity, agi=1.0):
     }
 
 
-def build_gbf(project_info, window_counts, plants, cfg, window_placements=None):
+def build_gbf(project_info, window_counts, plants, cfg, window_placements=None, window_dims=None):
     office = cfg.get("office", {})
     person = make_file_person(office)
     win_cfg = cfg.get("window_defaults", {})
@@ -704,10 +808,15 @@ def build_gbf(project_info, window_counts, plants, cfg, window_placements=None):
     }
 
     # Build window base entries
+    window_dims = window_dims or {}
     for wno, count in sorted(window_counts.items()):
         if wno.startswith("D"):
             continue
-        w, h = 1.0, 1.0
+        # Use extracted dims if available, else fallback to 1.0x1.0
+        if wno in window_dims:
+            w, h = window_dims[wno]
+        else:
+            w, h = 1.0, 1.0
         or_ = win_cfg.get("open_ratio", 0.5)
         oww = round(w * or_, 2)
         gbf["DataWindowBaseUser"][wno] = {
@@ -1635,6 +1744,7 @@ class GreenBuildingApp(tk.Tk):
 
             info = extract_project_info(blocks, texts)
             wins = extract_windows(blocks, texts)
+            win_dims = extract_window_dimensions(texts)
             plants = extract_plants(texts)
             placements = extract_window_placement(texts)
 
@@ -1646,7 +1756,16 @@ class GreenBuildingApp(tk.Tk):
 
             self.after(0, lambda: self._log(f"\n  窗戶: {len(wins)} 種", "info"))
             for w, c in sorted(wins.items()):
-                self.after(0, lambda w=w, c=c: self._log(f"    {w}: {c} 個", "info"))
+                dim_str = ""
+                if w in win_dims:
+                    dw, dh = win_dims[w]
+                    dim_str = f" ({dw}×{dh}m, {round(dw*dh, 2)} m²)"
+                self.after(0, lambda w=w, c=c, ds=dim_str: self._log(f"    {w}: {c} 個{ds}", "info"))
+
+            unmatched = [w for w in wins if w not in win_dims and not w.startswith("D")]
+            if unmatched:
+                self.after(0, lambda: self._log(
+                    f"  ⚠ {len(unmatched)} 種窗戶未偵測到尺寸，已用 1×1m 預設值", "warn"))
 
             if placements:
                 self.after(0, lambda: self._log(f"\n  窗戶配置: {len(placements)} 筆（自動偵測）", "good"))
@@ -1666,7 +1785,7 @@ class GreenBuildingApp(tk.Tk):
 
             # Reload config in case user changed settings
             self.cfg = load_config()
-            gbf = build_gbf(info, wins, plants, self.cfg, placements)
+            gbf = build_gbf(info, wins, plants, self.cfg, placements, win_dims)
 
             name = info.get("address", "green_building")
             # Sanitize filename
