@@ -32,6 +32,12 @@ try:
 except ImportError:
     HAS_DND = False
 
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 # ─────────────────────────────────────────────────────────
 # Color palette — Retro OS & Terminal Aesthetics
 # Light neutral base + amber/orange accent + thin borders
@@ -1002,6 +1008,170 @@ class LabeledCombo(tk.Frame):
 # Main Application
 # ─────────────────────────────────────────────────────────
 
+class SplashScreen(tk.Toplevel):
+    """Borderless splash window that animates the logo for ~2.5 seconds
+    before the main window appears.
+
+    Animation timeline (progress p = t / duration):
+      p ∈ [0.00, 0.35]  horizontal bar grows from center (ease-out)
+      p ∈ [0.12, 0.47]  vertical bar grows from center (ease-out)
+      p ∈ [0.50, 0.75]  center dot pops in with overshoot bounce
+      p ∈ [0.75, 0.85]  subtle hold / breathing
+      p ∈ [0.85, 1.00]  fade out via window alpha
+    """
+    WINDOW_SIZE = 440
+    LOGO_FRACTION = 0.55  # logo occupies this fraction of window
+    DURATION = 2.5        # seconds
+    FPS = 40
+    FG = (30, 35, 45, 255)
+    BG = (245, 243, 238)  # matches C["bg"]
+
+    def __init__(self, parent, on_done):
+        super().__init__(parent)
+        self.on_done = on_done
+        self.overrideredirect(True)
+        self.configure(bg="#%02x%02x%02x" % self.BG)
+        self.attributes("-topmost", True)
+
+        W = H = self.WINDOW_SIZE
+        sx = (self.winfo_screenwidth() - W) // 2
+        sy = (self.winfo_screenheight() - H) // 2
+        self.geometry(f"{W}x{H}+{sx}+{sy}")
+
+        self.canvas = tk.Canvas(
+            self, width=W, height=H,
+            bg="#%02x%02x%02x" % self.BG,
+            highlightthickness=0, bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        # Dismiss on click (respect user's time)
+        self.canvas.bind("<Button-1>", lambda e: self._finish())
+
+        self._start = time.time()
+        self._finished = False
+        self._photo = None  # keep reference to prevent GC
+        self._tick()
+
+    # ── animation helpers ─────────────────────────────────
+    @staticmethod
+    def _ease_out_cubic(t):
+        t = max(0.0, min(1.0, t))
+        return 1 - (1 - t) ** 3
+
+    @staticmethod
+    def _bounce(t):
+        """0 → 1 with overshoot (peaks at 1.3, settles at 1.0)."""
+        t = max(0.0, min(1.0, t))
+        if t < 0.6:
+            return (t / 0.6) * 1.3
+        return 1.3 - ((t - 0.6) / 0.4) * 0.3
+
+    def _compose(self, p):
+        """Render a single frame of the logo at progress p ∈ [0,1]."""
+        S = self.WINDOW_SIZE
+        # Start with solid bg so edges look clean on non-transparent display
+        img = Image.new("RGB", (S, S), self.BG)
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        logo = int(S * self.LOGO_FRACTION)
+        ox = (S - logo) // 2
+        oy = (S - logo) // 2
+
+        def u(vx):
+            return ox + vx / 100.0 * logo
+
+        def v(vy):
+            return oy + vy / 100.0 * logo
+
+        corner = u(51) - u(50)  # corresponds to rx=1 in the SVG
+
+        # Horizontal bar: expands from x=50 outward to 64 wide
+        h_progress = self._ease_out_cubic(p / 0.35) if p <= 0.35 else 1.0
+        if h_progress > 0:
+            half_w = 32 * h_progress
+            draw.rounded_rectangle(
+                [u(50 - half_w), v(46), u(50 + half_w), v(54)],
+                radius=corner, fill=self.FG,
+            )
+
+        # Vertical bar: starts at p=0.12, expands from y=50 outward to 64 tall
+        if p > 0.12:
+            v_progress = self._ease_out_cubic((p - 0.12) / 0.35)
+            v_progress = min(v_progress, 1.0)
+            half_h = 32 * v_progress
+            draw.rounded_rectangle(
+                [u(46), v(50 - half_h), u(54), v(50 + half_h)],
+                radius=corner, fill=self.FG,
+            )
+
+        # Center void (white square) — appears with the bars
+        if p > 0:
+            draw.rectangle(
+                [u(44), v(44), u(56), v(56)],
+                fill=self.BG,
+            )
+
+        # Center dot: bounce in at p=0.5
+        if p > 0.50:
+            bounce = self._bounce((p - 0.50) / 0.25) if p < 0.75 else 1.0
+            # Subtle breathing in hold phase
+            if 0.75 <= p < 0.85:
+                breathe = 1.0 + 0.08 * (1 - ((p - 0.80) / 0.05) ** 2 if 0.75 <= p <= 0.85 else 0)
+                bounce *= max(1.0, breathe)
+            r = 2.5 * bounce
+            draw.ellipse(
+                [u(50 - r), v(50 - r), u(50 + r), v(50 + r)],
+                fill=self.FG,
+            )
+
+        return img
+
+    def _tick(self):
+        if self._finished:
+            return
+        t = time.time() - self._start
+        p = min(t / self.DURATION, 1.0)
+
+        try:
+            img = self._compose(p)
+            self._photo = ImageTk.PhotoImage(img)
+            self.canvas.delete("all")
+            self.canvas.create_image(
+                self.WINDOW_SIZE // 2, self.WINDOW_SIZE // 2,
+                image=self._photo,
+            )
+        except Exception:
+            # If rendering fails, just finish gracefully
+            self._finish()
+            return
+
+        # Fade-out during last 15% of timeline
+        if p > 0.85:
+            alpha = max(0.0, (1.0 - p) / 0.15)
+            try:
+                self.attributes("-alpha", alpha)
+            except Exception:
+                pass
+
+        if p >= 1.0:
+            self._finish()
+            return
+
+        self.after(int(1000 / self.FPS), self._tick)
+
+    def _finish(self):
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        if self.on_done:
+            self.on_done()
+
+
 class GreenBuildingApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1027,6 +1197,23 @@ class GreenBuildingApp(tk.Tk):
         if HAS_DND:
             self.update_idletasks()  # ensure window handle exists
             windnd.hook_dropfiles(self, func=self._on_drop_files, force_unicode=True)
+
+        # Splash animation (if PIL available): hide main window, animate, then show
+        if HAS_PIL:
+            self.withdraw()
+            self.update_idletasks()
+            SplashScreen(self, on_done=self._after_splash)
+        else:
+            self._after_splash()
+
+    def _after_splash(self):
+        """Reveal the main window and run startup checks."""
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
 
         # Show startup disclaimer
         self.after(200, self._show_disclaimer)
