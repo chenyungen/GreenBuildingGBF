@@ -431,6 +431,44 @@ def extract_window_dimensions(texts):
     return result
 
 
+def extract_green_materials(csv_path):
+    """從 GBM LISP 匯出的 CSV 讀取綠建材空間資料。
+
+    CSV 欄位（UTF-8 with BOM）：
+    space_id, Ai1_m2, Li_m, k, H2_m, Ai4_m2, Ai2_m2, Gi1_m2, Gi4_m2,
+    ceiling_material, wall_material
+
+    回傳 list of dict，每一筆代表一個空間。
+    """
+    import csv
+    if not os.path.exists(csv_path):
+        return []
+    results = []
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    results.append({
+                        "space_id": (row.get("space_id") or "").strip(),
+                        "Ai1": float(row.get("Ai1_m2") or 0),
+                        "Li":  float(row.get("Li_m") or 0),
+                        "k":   float(row.get("k") or 0.8),
+                        "H2":  float(row.get("H2_m") or 2.8),
+                        "Ai4": float(row.get("Ai4_m2") or 0),
+                        "Ai2": float(row.get("Ai2_m2") or 0),
+                        "Gi1": float(row.get("Gi1_m2") or 0),
+                        "Gi4": float(row.get("Gi4_m2") or 0),
+                        "ceiling_material": (row.get("ceiling_material") or "").strip(),
+                        "wall_material": (row.get("wall_material") or "").strip(),
+                    })
+                except (ValueError, TypeError):
+                    continue
+    except Exception:
+        return []
+    return results
+
+
 def extract_plants(texts):
     plants = []
     target = [t for t in texts if t["layer"] == "2-戶外地坪"]
@@ -701,7 +739,7 @@ def make_window_grid_entry(direction, floor, wno, quantity, agi=1.0):
     }
 
 
-def build_gbf(project_info, window_counts, plants, cfg, window_placements=None, window_dims=None):
+def build_gbf(project_info, window_counts, plants, cfg, window_placements=None, window_dims=None, green_materials=None):
     office = cfg.get("office", {})
     person = make_file_person(office)
     win_cfg = cfg.get("window_defaults", {})
@@ -838,6 +876,42 @@ def build_gbf(project_info, window_counts, plants, cfg, window_placements=None, 
             "ConstructionCode": "", "MaterialName": "",
             "ApprovedDocumentNumber": "", "DataCheck": "",
         }
+
+    # Build green material entries (from GBM LISP CSV)
+    # A1 = 天花板, A2 = 內部裝修總面積, A4 = 牆面, Gi1/Gi4 = 對應綠建材面積
+    if green_materials:
+        a1_data  = gbf["GreenBuildMaterialA1Data"]
+        a2_data  = gbf["GreenBuildMaterialA2Data"]
+        a4_data  = gbf["GreenBuildMaterialA4Data"]
+        gi1_data = gbf["GreenBuildMaterialGi1Data"]
+        gi4_data = gbf["GreenBuildMaterialGi4Data"]
+        for g in green_materials:
+            sid = g["space_id"]
+            a1_data.append({
+                "SpaceName": sid, "Area": round(g["Ai1"], 2),
+                "Material": g.get("ceiling_material", ""), "DataCheck": "",
+            })
+            a2_data.append({
+                "SpaceName": sid, "Area": round(g["Ai2"], 2),
+                "Li": round(g["Li"], 2), "K": round(g["k"], 2),
+                "H2": round(g["H2"], 2), "DataCheck": "",
+            })
+            a4_data.append({
+                "SpaceName": sid, "Area": round(g["Ai4"], 2),
+                "Material": g.get("wall_material", ""), "DataCheck": "",
+            })
+            if g["Gi1"] > 0:
+                gi1_data.append({
+                    "SpaceName": sid, "Area": round(g["Gi1"], 2),
+                    "Material": g.get("ceiling_material", ""),
+                    "HasGreenMark": True, "DataCheck": "",
+                })
+            if g["Gi4"] > 0:
+                gi4_data.append({
+                    "SpaceName": sid, "Area": round(g["Gi4"], 2),
+                    "Material": g.get("wall_material", ""),
+                    "HasGreenMark": True, "DataCheck": "",
+                })
 
     # Build plant entries
     for p in plants:
@@ -1968,11 +2042,31 @@ class GreenBuildingApp(tk.Tk):
                 self.after(0, lambda p=p: self._log(
                     f"    {p['name']} ({p['catalog']}) {p['area']} m2", "info"))
 
+            # Load green materials CSV from DWG folder (if exists)
+            green_materials = []
+            if self.dwg_path:
+                gm_csv = os.path.join(os.path.dirname(self.dwg_path), "green_materials.csv")
+                green_materials = extract_green_materials(gm_csv)
+            if green_materials:
+                self.after(0, lambda: self._log(
+                    f"\n  綠建材: {len(green_materials)} 個空間（從 green_materials.csv 載入）", "good"))
+                sum_a1 = sum(g["Ai1"] for g in green_materials)
+                sum_a2 = sum(g["Ai2"] for g in green_materials)
+                sum_gi1 = sum(g["Gi1"] for g in green_materials)
+                sum_gi4 = sum(g["Gi4"] for g in green_materials)
+                self.after(0, lambda: self._log(
+                    f"    Σ天花板 {sum_a1:.2f} m²  Σ內部裝修 {sum_a2:.2f} m²", "info"))
+                self.after(0, lambda: self._log(
+                    f"    Σ天花綠建材 {sum_gi1:.2f} m²  Σ牆面綠建材 {sum_gi4:.2f} m²", "info"))
+            else:
+                self.after(0, lambda: self._log(
+                    "\n  綠建材: 未找到 green_materials.csv（用 GBM LISP 產出後放到 DWG 同資料夾）", "warn"))
+
             self.after(0, lambda: self._log("\n組裝 GBF 檔案中...", "info"))
 
             # Reload config in case user changed settings
             self.cfg = load_config()
-            gbf = build_gbf(info, wins, plants, self.cfg, placements, win_dims)
+            gbf = build_gbf(info, wins, plants, self.cfg, placements, win_dims, green_materials)
 
             name = info.get("address", "green_building")
             # Sanitize filename
