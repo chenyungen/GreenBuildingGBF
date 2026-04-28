@@ -1789,11 +1789,13 @@ class GreenBuildingApp(tk.Tk):
 
         proj = self.cfg.get("project_defaults", {})
 
-        # 申請類型 — dropdown
+        # 申請類型 — dropdown (matches 綠建築電子化評估系統 v1.5.1 選項)
         APPLY_OPTIONS = [
-            "建造執照申請（含變更設計）",
             "使用執照申請",
-            "雜項執照申請",
+            "變更使用執照申請",
+            "建築物室內裝修申請",
+            "建造執照申請（含變更設計）",
+            "增建申請（含變更設計）",
         ]
         e = LabeledCombo(scroll_frame, "申請類型", APPLY_OPTIONS,
                           proj.get("apply_type", "建造執照申請（含變更設計）"))
