@@ -1155,6 +1155,143 @@ def write_gbf(data, path):
         json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
 
 
+def write_green_materials_xlsx(green_materials, path, project_info=None):
+    """匯出綠建材檢討表為 Excel（兩個工作表：詳細 + 彙總）。"""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return False
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "綠建材檢討"
+
+    title_font = Font(name="微軟正黑體", size=14, bold=True, color="1E232D")
+    header_font = Font(name="微軟正黑體", size=10, bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1E232D")
+    accent_fill = PatternFill("solid", fgColor="FCE9B8")
+    body_font = Font(name="微軟正黑體", size=10)
+    thin = Side(border_style="thin", color="888888")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    case_name = ""
+    if project_info:
+        case_name = project_info.get("address", "") or project_info.get("apply_type", "")
+    ws.merge_cells("A1:K1")
+    ws["A1"] = f"綠建材檢討表" + (f" — {case_name}" if case_name else "")
+    ws["A1"].font = title_font
+    ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 26
+
+    headers = ["空間編號", "天花板面積\nAi,1 (m²)", "內部周長\nLi (m)", "係數 k",
+               "天花板高度\nH2 (m)", "牆面面積\nAi,4 (m²)", "內部裝修總面積\nAi,2 (m²)",
+               "天花綠建材\nGi,1 (m²)", "牆面綠建材\nGi,4 (m²)",
+               "天花板材料", "牆面材料"]
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=3, column=col, value=h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center
+        c.border = border
+    ws.row_dimensions[3].height = 32
+
+    for i, g in enumerate(green_materials):
+        r = 4 + i
+        row_data = [
+            g["space_id"],
+            round(g["Ai1"], 2), round(g["Li"], 2),
+            round(g["k"], 2), round(g["H2"], 2),
+            round(g["Ai4"], 2), round(g["Ai2"], 2),
+            round(g["Gi1"], 2), round(g["Gi4"], 2),
+            g.get("ceiling_material", ""), g.get("wall_material", ""),
+        ]
+        for col, val in enumerate(row_data, 1):
+            c = ws.cell(row=r, column=col, value=val)
+            c.font = body_font
+            c.border = border
+            if col == 1:
+                c.alignment = center
+            elif col in (10, 11):
+                c.alignment = left
+            else:
+                c.alignment = right
+                if isinstance(val, (int, float)):
+                    c.number_format = "0.00"
+
+    n = len(green_materials)
+    if n > 0:
+        total_row = 4 + n
+        ws.cell(row=total_row, column=1, value="合計").font = Font(
+            name="微軟正黑體", size=10, bold=True)
+        ws.cell(row=total_row, column=1).fill = accent_fill
+        ws.cell(row=total_row, column=1).alignment = center
+        ws.cell(row=total_row, column=1).border = border
+        for col in (2, 6, 7, 8, 9):
+            letter = get_column_letter(col)
+            c = ws.cell(row=total_row, column=col,
+                        value=f"=SUM({letter}4:{letter}{4 + n - 1})")
+            c.font = Font(name="微軟正黑體", size=10, bold=True)
+            c.fill = accent_fill
+            c.alignment = right
+            c.number_format = "0.00"
+            c.border = border
+        for col in (3, 4, 5, 10, 11):
+            c = ws.cell(row=total_row, column=col, value="")
+            c.fill = accent_fill
+            c.border = border
+
+    widths = [10, 14, 12, 8, 14, 14, 16, 14, 14, 18, 18]
+    for col, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.freeze_panes = "A4"
+
+    ws2 = wb.create_sheet("彙總")
+    ws2.column_dimensions["A"].width = 26
+    ws2.column_dimensions["B"].width = 18
+
+    a1_total = sum(g["Ai1"] for g in green_materials) or 1
+    a2_total = sum(g["Ai2"] for g in green_materials) or 1
+    gi1_total = sum(g["Gi1"] for g in green_materials)
+    gi4_total = sum(g["Gi4"] for g in green_materials)
+
+    summary_rows = [
+        ("案件名稱", case_name or "—"),
+        ("空間數", n),
+        ("", ""),
+        ("Σ天花板面積 (m²)", sum(g["Ai1"] for g in green_materials)),
+        ("Σ內部裝修總面積 (m²)", sum(g["Ai2"] for g in green_materials)),
+        ("Σ天花綠建材面積 (m²)", gi1_total),
+        ("Σ牆面綠建材面積 (m²)", gi4_total),
+        ("", ""),
+        ("天花板綠建材使用率", f"{gi1_total / a1_total * 100:.1f} %"),
+        ("牆面綠建材使用率",   f"{gi4_total / a2_total * 100:.1f} %"),
+    ]
+    ws2.cell(row=1, column=1, value="綠建材檢討彙總").font = title_font
+    ws2.cell(row=1, column=1).alignment = center
+    ws2.merge_cells("A1:B1")
+    ws2.row_dimensions[1].height = 26
+
+    for i, (label, val) in enumerate(summary_rows, 3):
+        c1 = ws2.cell(row=i, column=1, value=label)
+        c2 = ws2.cell(row=i, column=2, value=val)
+        c1.font = Font(name="微軟正黑體", size=10, bold=True)
+        c2.font = body_font
+        c1.alignment = left
+        c2.alignment = right
+        if label and not label.startswith("Σ") and "使用率" not in label:
+            c1.fill = accent_fill
+        if isinstance(val, (int, float)):
+            c2.number_format = "0.00"
+
+    wb.save(path)
+    return True
+
+
 # ─────────────────────────────────────────────────────────
 # Custom tkinter widgets
 # ─────────────────────────────────────────────────────────
@@ -2297,30 +2434,23 @@ class GreenBuildingApp(tk.Tk):
             self.output_path = os.path.join(out_dir, f"{name}.GBF")
             write_gbf(gbf, self.output_path)
 
-            # ── Also produce a green-material-only GBF (for users who already
+            # ── Also produce a green-material Excel (for users who already
             #    filled in 節能 manually and only want to import 綠建材) ──
-            green_only_path = None
+            green_xlsx_path = None
             if green_materials:
-                gbf_green_only = build_gbf(
-                    info,
-                    window_counts={},
-                    plants=[],
-                    cfg=self.cfg,
-                    window_placements=None,
-                    window_dims=None,
-                    green_materials=green_materials,
-                )
-                green_only_path = os.path.join(out_dir, f"{name}_僅綠建材.GBF")
-                write_gbf(gbf_green_only, green_only_path)
+                xlsx_path = os.path.join(out_dir, f"{name}_綠建材.xlsx")
+                ok = write_green_materials_xlsx(green_materials, xlsx_path, info)
+                if ok:
+                    green_xlsx_path = xlsx_path
 
             self.after(0, lambda: self._log(""))
             self.after(0, lambda: self._log("=== 完成 ===", "head"))
             self.after(0, lambda: self._log(f"  完整 GBF:   {self.output_path}", "good"))
-            if green_only_path:
+            if green_xlsx_path:
                 self.after(0, lambda: self._log(
-                    f"  僅綠建材:   {green_only_path}", "good"))
+                    f"  綠建材 Excel: {green_xlsx_path}", "good"))
                 self.after(0, lambda: self._log(
-                    f"  → 節能已自行填寫完，匯入「僅綠建材」即可不覆蓋其他欄位", "info"))
+                    f"  → 節能已自行填寫完，可用 Excel 核對或單獨匯入綠建材", "info"))
             self.after(0, lambda: self._log(f"  用途類型: {gbf['UseClassGroup']}", "good"))
             self.after(0, lambda: self._log(f"  基地面積: {gbf['BaseArea']} m2", "good"))
             self.after(0, lambda: self._log(f"  樓地板面積: {gbf['TotalFloorArea']} m2", "good"))
