@@ -197,21 +197,53 @@ def connect_and_dump(dwg_path, log_fn):
     except Exception:
         acad = win32com.client.Dispatch("AutoCAD.Application")
         acad.Visible = True
+        time.sleep(3)
 
-    doc = acad.ActiveDocument
+    try:
+        acad.Visible = True
+    except Exception:
+        pass
+
+    # ── Determine if we have a usable active document ──
+    doc = None
+    try:
+        if acad.Documents.Count > 0:
+            doc = acad.ActiveDocument
+    except Exception:
+        doc = None
+
+    # ── Open the requested DWG if needed ──
     if dwg_path:
         dwg_name = os.path.basename(dwg_path)
         need_open = True
-        try:
-            if doc and doc.Name == dwg_name:
-                need_open = False
-        except Exception:
-            pass
+        if doc is not None:
+            try:
+                if doc.Name == dwg_name:
+                    need_open = False
+            except Exception:
+                need_open = True
         if need_open:
             log_fn(f"[*] 開啟圖檔: {dwg_name}")
-            acad.Documents.Open(dwg_path)
-            time.sleep(2)  # wait for AutoCAD to finish opening
+            for attempt in range(3):
+                try:
+                    acad.Documents.Open(dwg_path)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise RuntimeError(
+                            f"無法開啟 DWG: {dwg_path}\n"
+                            f"請手動在 AutoCAD 開啟此圖檔，再按掃描。\n原始錯誤: {e}"
+                        )
+                    time.sleep(2)
+            time.sleep(2)
             doc = acad.ActiveDocument
+
+    if doc is None:
+        raise RuntimeError(
+            "AutoCAD 沒有開啟任何圖檔。\n"
+            "請先把要掃描的 DWG 拖到本應用程式（或按上方選擇圖檔），\n"
+            "或者直接在 AutoCAD 開啟 DWG 後再按掃描。"
+        )
 
     log_fn(f"[*] 圖面: {doc.Name}")
     log_fn("[*] 掃描中 (約 30-60 秒)...")
