@@ -1169,137 +1169,179 @@ def write_gbf(data, path):
 
 
 def write_green_materials_xlsx(green_materials, path, project_info=None):
-    """匯出綠建材檢討表為 Excel（兩個工作表：詳細 + 彙總）。"""
+    """匯出綠建材資料為 Excel — 嚴格依照「綠建築專章電子化評估系統」匯入格式。
+
+    產生 3 個工作表：
+    - 「系統參數與自訂資料」：參數區 + 空白窗戶清單 + 建築用途分頁名稱
+    - 「{用途分區名稱}」：空白窗戶配置區（讓系統認得分頁）
+    - 「綠建材資料」：A-1 + gi1 + gi2 由 green_materials 填入；其他區段為空殼
+
+    其他資料（窗戶、方位、配置）保持空白，以便只更新綠建材欄位。
+    """
     try:
+        import datetime
         import openpyxl
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-        from openpyxl.utils import get_column_letter
     except ImportError:
         return False
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "綠建材檢討"
-
-    title_font = Font(name="微軟正黑體", size=14, bold=True, color="1E232D")
-    header_font = Font(name="微軟正黑體", size=10, bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1E232D")
-    accent_fill = PatternFill("solid", fgColor="FCE9B8")
-    body_font = Font(name="微軟正黑體", size=10)
-    thin = Side(border_style="thin", color="888888")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center")
-    right = Alignment(horizontal="right", vertical="center")
-    left = Alignment(horizontal="left", vertical="center")
-
-    case_name = ""
+    use_cat = ""
     if project_info:
-        case_name = project_info.get("address", "") or project_info.get("apply_type", "")
-    ws.merge_cells("A1:K1")
-    ws["A1"] = f"綠建材檢討表" + (f" — {case_name}" if case_name else "")
-    ws["A1"].font = title_font
-    ws["A1"].alignment = center
-    ws.row_dimensions[1].height = 26
+        use_cat = (project_info.get("use_type") or "").strip()
+    if not use_cat:
+        use_cat = "G-3 店舖診所"
 
-    headers = ["空間編號", "天花板面積\nAi,1 (m²)", "內部周長\nLi (m)", "係數 k",
-               "天花板高度\nH2 (m)", "牆面面積\nAi,4 (m²)", "內部裝修總面積\nAi,2 (m²)",
-               "天花綠建材\nGi,1 (m²)", "牆面綠建材\nGi,4 (m²)",
-               "天花板材料", "牆面材料"]
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=3, column=col, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = center
-        c.border = border
-    ws.row_dimensions[3].height = 32
+    wb = openpyxl.Workbook()
 
-    for i, g in enumerate(green_materials):
-        r = 4 + i
-        row_data = [
-            g["space_id"],
-            round(g["Ai1"], 2), round(g["Li"], 2),
-            round(g["k"], 2), round(g["H2"], 2),
-            round(g["Ai4"], 2), round(g["Ai2"], 2),
-            round(g["Gi1"], 2), round(g["Gi4"], 2),
-            g.get("ceiling_material", ""), g.get("wall_material", ""),
-        ]
-        for col, val in enumerate(row_data, 1):
-            c = ws.cell(row=r, column=col, value=val)
-            c.font = body_font
-            c.border = border
-            if col == 1:
-                c.alignment = center
-            elif col in (10, 11):
-                c.alignment = left
-            else:
-                c.alignment = right
-                if isinstance(val, (int, float)):
-                    c.number_format = "0.00"
-
-    n = len(green_materials)
-    if n > 0:
-        total_row = 4 + n
-        ws.cell(row=total_row, column=1, value="合計").font = Font(
-            name="微軟正黑體", size=10, bold=True)
-        ws.cell(row=total_row, column=1).fill = accent_fill
-        ws.cell(row=total_row, column=1).alignment = center
-        ws.cell(row=total_row, column=1).border = border
-        for col in (2, 6, 7, 8, 9):
-            letter = get_column_letter(col)
-            c = ws.cell(row=total_row, column=col,
-                        value=f"=SUM({letter}4:{letter}{4 + n - 1})")
-            c.font = Font(name="微軟正黑體", size=10, bold=True)
-            c.fill = accent_fill
-            c.alignment = right
-            c.number_format = "0.00"
-            c.border = border
-        for col in (3, 4, 5, 10, 11):
-            c = ws.cell(row=total_row, column=col, value="")
-            c.fill = accent_fill
-            c.border = border
-
-    widths = [10, 14, 12, 8, 14, 14, 16, 14, 14, 18, 18]
-    for col, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(col)].width = w
-    ws.freeze_panes = "A4"
-
-    ws2 = wb.create_sheet("彙總")
-    ws2.column_dimensions["A"].width = 26
-    ws2.column_dimensions["B"].width = 18
-
-    a1_total = sum(g["Ai1"] for g in green_materials) or 1
-    a2_total = sum(g["Ai2"] for g in green_materials) or 1
-    gi1_total = sum(g["Gi1"] for g in green_materials)
-    gi4_total = sum(g["Gi4"] for g in green_materials)
-
-    summary_rows = [
-        ("案件名稱", case_name or "—"),
-        ("空間數", n),
-        ("", ""),
-        ("Σ天花板面積 (m²)", sum(g["Ai1"] for g in green_materials)),
-        ("Σ內部裝修總面積 (m²)", sum(g["Ai2"] for g in green_materials)),
-        ("Σ天花綠建材面積 (m²)", gi1_total),
-        ("Σ牆面綠建材面積 (m²)", gi4_total),
-        ("", ""),
-        ("天花板綠建材使用率", f"{gi1_total / a1_total * 100:.1f} %"),
-        ("牆面綠建材使用率",   f"{gi4_total / a2_total * 100:.1f} %"),
+    # ════════ Sheet 1: 系統參數與自訂資料 ════════
+    ws1 = wb.active
+    ws1.title = "系統參數與自訂資料"
+    ws1["A1"] = "此為匯入資料程式用參數資訊，請勿任意修改，以免資料無法匯入。"
+    ws1["A2"] = "這是個開發中的功能，目前只支援窗戶資料的匯出。"
+    ws1["A3"] = "綠建築專章電子化評估系統 Excel 格式資料檔"
+    ws1["A5"] = "參數"
+    ws1["B5"] = datetime.datetime(2001, 5, 1)
+    ws1["B6"] = "綠建材分頁資料"
+    ws1["C6"] = "有"
+    ws1["A7"] = "欄位"
+    headers1 = [
+        "窗戶編號", "窗寬(m)", "窗高(m)", "單扇窗戶面積(m²)",
+        "可開窗寬(m)", "可開窗高(m)", "可開窗面積(m²)",
+        "玻璃種類", "玻璃顏色", "玻璃代號", "玻璃名稱",
+        "玻璃厚度", "窗框", "開窗分類", "綠建材",
+        "構造代號", "材料名稱", "綠建材有效認可文件編號",
     ]
-    ws2.cell(row=1, column=1, value="綠建材檢討彙總").font = title_font
-    ws2.cell(row=1, column=1).alignment = center
-    ws2.merge_cells("A1:B1")
-    ws2.row_dimensions[1].height = 26
+    for i, h in enumerate(headers1):
+        ws1.cell(row=7, column=2 + i, value=h)
+    ws1["O8"] = "固定窗\n可開窗"
+    ws1["P8"] = "是\n否"
+    ws1["A10"] = "以下開始為自訂窗戶資料"
+    ws1["A11"] = "以上為全部自訂窗戶資料"
+    ws1["A13"] = "以下開始為建築用途分頁名稱"
+    ws1["B14"] = use_cat
+    ws1["A15"] = "以上為全部建築用途分頁名稱"
 
-    for i, (label, val) in enumerate(summary_rows, 3):
-        c1 = ws2.cell(row=i, column=1, value=label)
-        c2 = ws2.cell(row=i, column=2, value=val)
-        c1.font = Font(name="微軟正黑體", size=10, bold=True)
-        c2.font = body_font
-        c1.alignment = left
-        c2.alignment = right
-        if label and not label.startswith("Σ") and "使用率" not in label:
-            c1.fill = accent_fill
-        if isinstance(val, (int, float)):
-            c2.number_format = "0.00"
+    # ════════ Sheet 2: 用途分區（空白窗戶資料） ════════
+    safe_name = re.sub(r'[\[\]:\*\?/\\]', '_', use_cat)[:31]
+    ws2 = wb.create_sheet(safe_name)
+    ws2["A1"] = "前面 10 行為參數與說明資料，請勿任意修改，以免資料無法匯入。"
+    ws2["A3"] = use_cat
+    ws2["A5"] = "窗戶資料"
+    ws2["A6"] = "欄位"
+    headers2 = [
+        "空調型建築物\n耗能特性區分", "方位", "樓層", "住戶編號", "居室編號",
+        "窗戶編號", "傾斜角 °", "具相同方位與遮陽類型的窗戶數量",
+        "遮陽種類", "水平遮陽寬度Ws", "垂直遮陽高度Hs",
+        "遮陽寬度X1", "遮陽深度X2", "遮陽高度Y1", "遮陽深度Y2",
+    ]
+    for i, h in enumerate(headers2):
+        ws2.cell(row=6, column=2 + i, value=h)
+    ws2["A7"] = "說明"
+    ws2["A9"] = "以下開始為窗戶資料內容"
+    ws2["A10"] = "以上為全部窗戶資料內容"
+
+    # ════════ Sheet 3: 綠建材資料 ════════
+    ws3 = wb.create_sheet("綠建材資料")
+    r = 2
+
+    def write_section_header(title, headers):
+        nonlocal r
+        ws3.cell(row=r, column=1, value=title); r += 1
+        for i, h in enumerate(headers):
+            ws3.cell(row=r, column=i + 1, value=h)
+        r += 1
+
+    def write_section_markers(title, data_writer):
+        nonlocal r
+        ws3.cell(row=r, column=1, value=f"以下開始為{title}資料"); r += 1
+        if data_writer:
+            data_writer()
+        ws3.cell(row=r, column=1, value=f"以上為全部{title}資料"); r += 4
+
+    a1_title = "A-1 建築物室內總表面積(Ai)計算表"
+    a1_headers = [
+        "樓層", "樓層之總樓地板面積(m²)", "可扣除面積(m²)", "空間用途",
+        "一般空間/大型空間", "平均高度(m)", "Lf",
+        "未使用窗類綠建材面積(m²)", "表面積(m²)", "備註(大型空間請註明)",
+    ]
+    write_section_header(a1_title, a1_headers)
+
+    def _write_a1():
+        nonlocal r
+        for g in green_materials:
+            ws3.cell(row=r, column=1, value=g.get("floor", "1F"))
+            ws3.cell(row=r, column=2, value=round(g["Ai1"], 2))
+            ws3.cell(row=r, column=3, value=0)
+            ws3.cell(row=r, column=4, value=g["space_id"])
+            ws3.cell(row=r, column=5, value="一般空間")
+            ws3.cell(row=r, column=6, value=round(g["H2"], 2))
+            ws3.cell(row=r, column=7, value=round(g["Li"], 2))
+            ws3.cell(row=r, column=8, value=0)
+            ws3.cell(row=r, column=9, value=round(g["Ai2"], 2))
+            r += 1
+    write_section_markers(a1_title, _write_a1)
+
+    ao_titles = [
+        "A-2 戶外地面車道面積(Ao1)計算表",
+        "A-3 戶外地面汽車出入緩衝空間面積(Ao2)計算表",
+        "A-4 戶外地面消防車輛救災活動空間面積(Ao3)計算表",
+        "A-5 戶外地面無須鋪設地面材料部位面積(Ao4)計算表",
+    ]
+    ao_headers = [
+        "空間編號", "W1(m)", "W2(m)", "面積(m²)",
+        "備註(非矩形平面或得扣除之面積請註明)",
+    ]
+    for title in ao_titles:
+        write_section_header(title, ao_headers)
+        write_section_markers(title, None)
+
+    gi_headers = [
+        "樓層", "空間編號", "構造代號", "材料名稱",
+        "綠建材有效認可文件編號", "綠建材尺寸長×寬(m)", "綠建材面積(m²)",
+    ]
+    write_section_header("gi1 天花板", gi_headers)
+
+    def _write_gi1():
+        nonlocal r
+        for g in green_materials:
+            if g["Gi1"] > 0:
+                ws3.cell(row=r, column=1, value=g.get("floor", "1F"))
+                ws3.cell(row=r, column=2, value=g["space_id"])
+                ws3.cell(row=r, column=4, value=g.get("ceiling_material", ""))
+                ws3.cell(row=r, column=7, value=round(g["Gi1"], 2))
+                r += 1
+    write_section_markers("gi1 天花板", _write_gi1)
+
+    write_section_header("gi2 內部牆面", gi_headers)
+
+    def _write_gi2():
+        nonlocal r
+        for g in green_materials:
+            if g["Gi4"] > 0:
+                ws3.cell(row=r, column=1, value=g.get("floor", "1F"))
+                ws3.cell(row=r, column=2, value=g["space_id"])
+                ws3.cell(row=r, column=4, value=g.get("wall_material", ""))
+                ws3.cell(row=r, column=7, value=round(g["Gi4"], 2))
+                r += 1
+    write_section_markers("gi2 內部牆面", _write_gi2)
+
+    gi3_title = "gi3 高度超過一點二公尺固定於地板之隔屏或兼作櫥櫃使用之隔屏"
+    write_section_header(gi3_title, gi_headers)
+    write_section_markers(gi3_title, None)
+
+    write_section_header("gi4 樓地板面", gi_headers)
+    write_section_markers("gi4 樓地板面", None)
+
+    gi5_headers = ["樓層", "空間編號", "窗戶編號", "相同窗戶數量"]
+    write_section_header("gi5 室內窗", gi5_headers)
+    write_section_markers("gi5 室內窗", None)
+
+    g2_title = "G2 建築物戶外地面綠建材使用總面積計算表"
+    g2_headers = [
+        "空間編號", "構造代號", "材料名稱", "綠建材有效認可文件編號",
+        "綠建材尺寸長×寬(m)", "綠建材面積(m²)", "備註",
+    ]
+    write_section_header(g2_title, g2_headers)
+    write_section_markers(g2_title, None)
 
     wb.save(path)
     return True
