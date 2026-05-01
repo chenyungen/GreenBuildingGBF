@@ -181,15 +181,27 @@ def save_config(cfg):
 # AutoCAD COM + AutoLISP dump
 # ─────────────────────────────────────────────────────────
 
-LISP_DUMP_CODE = r'''(progn (setq f (open "C:/temp/cad_dump.txt" "w")) (vlax-for ent (vla-get-modelspace (vla-get-activedocument (vlax-get-acad-object))) (setq oname (vla-get-objectname ent)) (cond ((= oname "AcDbBlockReference") (setq bname (vla-get-name ent)) (setq lay (vla-get-layer ent)) (setq attrs "") (if (= (vla-get-hasattributes ent) :vlax-true) (progn (setq attlist (vlax-invoke ent 'getattributes)) (foreach att attlist (setq attrs (strcat attrs (vla-get-tagstring att) "=" (vla-get-textstring att) "|"))))) (write-line (strcat "BLK~" lay "~" bname "~" attrs) f)) ((or (= oname "AcDbText") (= oname "AcDbMText")) (setq txt (vla-get-textstring ent)) (setq lay (vla-get-layer ent)) (setq ht (rtos (vla-get-height ent) 2 1)) (setq px (rtos (car (vlax-get ent 'insertionpoint)) 2 1)) (setq py (rtos (cadr (vlax-get ent 'insertionpoint)) 2 1)) (write-line (strcat "TXT~" lay "~" ht "~" px "~" py "~" txt) f)) ((and (= oname "AcDbPolyline") (= (vla-get-closed ent) :vlax-true)) (setq lay (vla-get-layer ent)) (setq lng (rtos (vla-get-length ent) 2 2)) (setq area (rtos (vla-get-area ent) 2 2)) (setq coords (vlax-safearray->list (vlax-variant-value (vla-get-coordinates ent)))) (setq pts "") (setq i 0) (setq nc (length coords)) (while (< i nc) (setq pts (strcat pts (rtos (nth i coords) 2 1) "," (rtos (nth (1+ i) coords) 2 1) ";")) (setq i (+ i 2))) (write-line (strcat "PLY~" lay "~" area "~" lng "~" pts) f)) ((= oname "AcDbHatch") (setq lay (vla-get-layer ent)) (setq pat (vla-get-patternname ent)) (setq harea (rtos (vla-get-area ent) 2 4)) (setq minpt nil) (setq maxpt nil) (vl-catch-all-apply 'vla-getboundingbox (list ent 'minpt 'maxpt)) (if (and minpt maxpt) (progn (setq mn (vlax-safearray->list minpt)) (setq mx (vlax-safearray->list maxpt)) (setq cx (rtos (/ (+ (car mn) (car mx)) 2.0) 2 1)) (setq cy (rtos (/ (+ (cadr mn) (cadr mx)) 2.0) 2 1)) (write-line (strcat "HCH~" lay "~" pat "~" harea "~" cx "," cy) f))))) ) (close f) (princ "DONE"))'''
+LISP_DUMP_CODE = r'''(progn (setq f (open "__DUMP_PATH__" "w")) (vlax-for ent (vla-get-modelspace (vla-get-activedocument (vlax-get-acad-object))) (setq oname (vla-get-objectname ent)) (cond ((= oname "AcDbBlockReference") (setq bname (vla-get-name ent)) (setq lay (vla-get-layer ent)) (setq attrs "") (if (= (vla-get-hasattributes ent) :vlax-true) (progn (setq attlist (vlax-invoke ent 'getattributes)) (foreach att attlist (setq attrs (strcat attrs (vla-get-tagstring att) "=" (vla-get-textstring att) "|"))))) (write-line (strcat "BLK~" lay "~" bname "~" attrs) f)) ((or (= oname "AcDbText") (= oname "AcDbMText")) (setq txt (vla-get-textstring ent)) (setq lay (vla-get-layer ent)) (setq ht (rtos (vla-get-height ent) 2 1)) (setq px (rtos (car (vlax-get ent 'insertionpoint)) 2 1)) (setq py (rtos (cadr (vlax-get ent 'insertionpoint)) 2 1)) (write-line (strcat "TXT~" lay "~" ht "~" px "~" py "~" txt) f)) ((and (= oname "AcDbPolyline") (= (vla-get-closed ent) :vlax-true)) (setq lay (vla-get-layer ent)) (setq lng (rtos (vla-get-length ent) 2 2)) (setq area (rtos (vla-get-area ent) 2 2)) (setq coords (vlax-safearray->list (vlax-variant-value (vla-get-coordinates ent)))) (setq pts "") (setq i 0) (setq nc (length coords)) (while (< i nc) (setq pts (strcat pts (rtos (nth i coords) 2 1) "," (rtos (nth (1+ i) coords) 2 1) ";")) (setq i (+ i 2))) (write-line (strcat "PLY~" lay "~" area "~" lng "~" pts) f)) ((= oname "AcDbHatch") (setq lay (vla-get-layer ent)) (setq pat (vla-get-patternname ent)) (setq harea (rtos (vla-get-area ent) 2 4)) (setq minpt nil) (setq maxpt nil) (vl-catch-all-apply 'vla-getboundingbox (list ent 'minpt 'maxpt)) (if (and minpt maxpt) (progn (setq mn (vlax-safearray->list minpt)) (setq mx (vlax-safearray->list maxpt)) (setq cx (rtos (/ (+ (car mn) (car mx)) 2.0) 2 1)) (setq cy (rtos (/ (+ (cadr mn) (cadr mx)) 2.0) 2 1)) (write-line (strcat "HCH~" lay "~" pat "~" harea "~" cx "," cy) f))))) ) (close f) (princ "DONE"))'''
 
 
 def connect_and_dump(dwg_path, log_fn):
     import win32com.client
-    dump_path = "C:/temp/cad_dump.txt"
+    # Use a unique timestamped dump file each run to avoid collisions with
+    # AutoCAD still holding a handle from a previous scan.
     os.makedirs("C:/temp", exist_ok=True)
-    if os.path.exists(dump_path):
-        os.remove(dump_path)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    dump_path = f"C:/temp/cad_dump_{ts}_{os.getpid()}.txt"
+    try:
+        for old in os.listdir("C:/temp"):
+            if old.startswith("cad_dump") and old.endswith(".txt"):
+                old_path = os.path.join("C:/temp", old)
+                try:
+                    if time.time() - os.path.getmtime(old_path) > 300:
+                        os.remove(old_path)
+                except (OSError, PermissionError):
+                    pass
+    except OSError:
+        pass
 
     log_fn("[*] 連接 AutoCAD 中...")
     try:
@@ -247,7 +259,8 @@ def connect_and_dump(dwg_path, log_fn):
 
     log_fn(f"[*] 圖面: {doc.Name}")
     log_fn("[*] 掃描中 (約 30-60 秒)...")
-    doc.SendCommand(LISP_DUMP_CODE + "\n")
+    lisp_code = LISP_DUMP_CODE.replace("__DUMP_PATH__", dump_path)
+    doc.SendCommand(lisp_code + "\n")
 
     for i in range(120):
         time.sleep(1)
