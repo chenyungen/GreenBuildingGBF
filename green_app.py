@@ -2265,9 +2265,30 @@ class GreenBuildingApp(tk.Tk):
             self.output_path = os.path.join(out_dir, f"{name}.GBF")
             write_gbf(gbf, self.output_path)
 
+            # ── Also produce a green-material-only GBF (for users who already
+            #    filled in 節能 manually and only want to import 綠建材) ──
+            green_only_path = None
+            if green_materials:
+                gbf_green_only = build_gbf(
+                    info,
+                    window_counts={},
+                    plants=[],
+                    cfg=self.cfg,
+                    window_placements=None,
+                    window_dims=None,
+                    green_materials=green_materials,
+                )
+                green_only_path = os.path.join(out_dir, f"{name}_僅綠建材.GBF")
+                write_gbf(gbf_green_only, green_only_path)
+
             self.after(0, lambda: self._log(""))
             self.after(0, lambda: self._log("=== 完成 ===", "head"))
-            self.after(0, lambda: self._log(f"  輸出檔案: {self.output_path}", "good"))
+            self.after(0, lambda: self._log(f"  完整 GBF:   {self.output_path}", "good"))
+            if green_only_path:
+                self.after(0, lambda: self._log(
+                    f"  僅綠建材:   {green_only_path}", "good"))
+                self.after(0, lambda: self._log(
+                    f"  → 節能已自行填寫完，匯入「僅綠建材」即可不覆蓋其他欄位", "info"))
             self.after(0, lambda: self._log(f"  用途類型: {gbf['UseClassGroup']}", "good"))
             self.after(0, lambda: self._log(f"  基地面積: {gbf['BaseArea']} m2", "good"))
             self.after(0, lambda: self._log(f"  樓地板面積: {gbf['TotalFloorArea']} m2", "good"))
