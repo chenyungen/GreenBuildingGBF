@@ -181,7 +181,7 @@ def save_config(cfg):
 # AutoCAD COM + AutoLISP dump
 # ─────────────────────────────────────────────────────────
 
-LISP_DUMP_CODE = r'''(progn (setq f (open "C:/temp/cad_dump.txt" "w")) (vlax-for ent (vla-get-modelspace (vla-get-activedocument (vlax-get-acad-object))) (setq oname (vla-get-objectname ent)) (cond ((= oname "AcDbBlockReference") (setq bname (vla-get-name ent)) (setq lay (vla-get-layer ent)) (setq attrs "") (if (= (vla-get-hasattributes ent) :vlax-true) (progn (setq attlist (vlax-invoke ent 'getattributes)) (foreach att attlist (setq attrs (strcat attrs (vla-get-tagstring att) "=" (vla-get-textstring att) "|"))))) (write-line (strcat "BLK~" lay "~" bname "~" attrs) f)) ((or (= oname "AcDbText") (= oname "AcDbMText")) (setq txt (vla-get-textstring ent)) (setq lay (vla-get-layer ent)) (setq ht (rtos (vla-get-height ent) 2 1)) (setq px (rtos (car (vlax-get ent 'insertionpoint)) 2 1)) (setq py (rtos (cadr (vlax-get ent 'insertionpoint)) 2 1)) (write-line (strcat "TXT~" lay "~" ht "~" px "~" py "~" txt) f)))) (close f) (princ "DONE"))'''
+LISP_DUMP_CODE = r'''(progn (setq f (open "C:/temp/cad_dump.txt" "w")) (vlax-for ent (vla-get-modelspace (vla-get-activedocument (vlax-get-acad-object))) (setq oname (vla-get-objectname ent)) (cond ((= oname "AcDbBlockReference") (setq bname (vla-get-name ent)) (setq lay (vla-get-layer ent)) (setq attrs "") (if (= (vla-get-hasattributes ent) :vlax-true) (progn (setq attlist (vlax-invoke ent 'getattributes)) (foreach att attlist (setq attrs (strcat attrs (vla-get-tagstring att) "=" (vla-get-textstring att) "|"))))) (write-line (strcat "BLK~" lay "~" bname "~" attrs) f)) ((or (= oname "AcDbText") (= oname "AcDbMText")) (setq txt (vla-get-textstring ent)) (setq lay (vla-get-layer ent)) (setq ht (rtos (vla-get-height ent) 2 1)) (setq px (rtos (car (vlax-get ent 'insertionpoint)) 2 1)) (setq py (rtos (cadr (vlax-get ent 'insertionpoint)) 2 1)) (write-line (strcat "TXT~" lay "~" ht "~" px "~" py "~" txt) f)) ((and (= oname "AcDbPolyline") (= (vla-get-closed ent) :vlax-true)) (setq lay (vla-get-layer ent)) (setq lng (rtos (vla-get-length ent) 2 2)) (setq area (rtos (vla-get-area ent) 2 2)) (setq coords (vlax-safearray->list (vlax-variant-value (vla-get-coordinates ent)))) (setq pts "") (setq i 0) (setq nc (length coords)) (while (< i nc) (setq pts (strcat pts (rtos (nth i coords) 2 1) "," (rtos (nth (1+ i) coords) 2 1) ";")) (setq i (+ i 2))) (write-line (strcat "PLY~" lay "~" area "~" lng "~" pts) f)) ((= oname "AcDbHatch") (setq lay (vla-get-layer ent)) (setq pat (vla-get-patternname ent)) (setq harea (rtos (vla-get-area ent) 2 4)) (setq minpt nil) (setq maxpt nil) (vl-catch-all-apply 'vla-getboundingbox (list ent 'minpt 'maxpt)) (if (and minpt maxpt) (progn (setq mn (vlax-safearray->list minpt)) (setq mx (vlax-safearray->list maxpt)) (setq cx (rtos (/ (+ (car mn) (car mx)) 2.0) 2 1)) (setq cy (rtos (/ (+ (cadr mn) (cadr mx)) 2.0) 2 1)) (write-line (strcat "HCH~" lay "~" pat "~" harea "~" cx "," cy) f))))) ) (close f) (princ "DONE"))'''
 
 
 def connect_and_dump(dwg_path, log_fn):
@@ -241,7 +241,7 @@ def parse_dump(dump_path):
     with open(dump_path, "rb") as f:
         raw = f.read()
     content = raw.decode("cp950", errors="replace")
-    blocks, texts = [], []
+    blocks, texts, polylines, hatches = [], [], [], []
     for line in content.splitlines():
         parts = line.split("~")
         if parts[0] == "BLK" and len(parts) >= 4:
@@ -260,7 +260,172 @@ def parse_dump(dump_path):
                 "y": float(parts[4]) if parts[4] else 0,
                 "text": "~".join(parts[5:]),
             })
-    return blocks, texts
+        elif parts[0] == "PLY" and len(parts) >= 5:
+            try:
+                vertices = []
+                for pair in parts[4].rstrip(";").split(";"):
+                    if "," in pair:
+                        x, y = pair.split(",", 1)
+                        vertices.append((float(x), float(y)))
+                if len(vertices) >= 3:
+                    polylines.append({
+                        "layer": parts[1],
+                        "area": float(parts[2]) if parts[2] else 0,
+                        "length": float(parts[3]) if parts[3] else 0,
+                        "vertices": vertices,
+                    })
+            except (ValueError, IndexError):
+                pass
+        elif parts[0] == "HCH" and len(parts) >= 5:
+            try:
+                cx, cy = parts[4].split(",", 1)
+                hatches.append({
+                    "layer": parts[1],
+                    "pattern": parts[2],
+                    "area": float(parts[3]) if parts[3] else 0,
+                    "cx": float(cx),
+                    "cy": float(cy),
+                })
+            except (ValueError, IndexError):
+                pass
+    return blocks, texts, polylines, hatches
+
+
+# ─────────────────────────────────────────────────────────
+# Auto green material detection (ray-casting)
+# ─────────────────────────────────────────────────────────
+
+DEFAULT_PATTERN_MAP = {
+    "ANSI31":   ("乳膠漆",       True),
+    "ANSI32":   ("乳膠漆",       True),
+    "AR-HBONE": ("矽酸鈣天花板", True),
+    "AR-PARQ1": ("矽酸鈣天花板", True),
+    "NET":      ("矽酸鈣天花板", True),
+    "CROSS":    ("乳膠漆",       True),
+    "SQUARE":   ("矽酸鈣天花板", True),
+    "GRASS":    ("乳膠漆",       True),
+    "DOTS":     ("一般材料",     False),
+    "AR-CONC":  ("混凝土",       False),
+    "SOLID":    ("一般材料",     False),
+}
+
+
+def point_in_polygon(x, y, vertices):
+    """Ray-casting algorithm. vertices = list of (x, y) tuples."""
+    n = len(vertices)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = vertices[i]
+        xj, yj = vertices[j]
+        if ((yi > y) != (yj > y)):
+            denom = yj - yi
+            if denom != 0:
+                x_at_y = (xj - xi) * (y - yi) / denom + xi
+                if x < x_at_y:
+                    inside = not inside
+        j = i
+    return inside
+
+
+def polygon_bbox(vertices):
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def detect_green_materials_auto(polylines, hatches, texts, pattern_map=None,
+                                 k_default=0.8, h2_default=2.8,
+                                 min_room_area=1.0):
+    """從 dump 出來的多邊形與剖面線自動推算每個房間的綠建材分佈。"""
+    if pattern_map is None:
+        pattern_map = DEFAULT_PATTERN_MAP
+
+    rooms = [p for p in polylines if p["area"] >= min_room_area]
+    if not rooms:
+        return []
+
+    for room in rooms:
+        room["_bbox"] = polygon_bbox(room["vertices"])
+
+    space_id_re = re.compile(r"^\d{1,4}$")
+    candidate_texts = [t for t in texts if space_id_re.match(t["text"].strip())]
+
+    results = []
+    used_space_ids = set()
+
+    rooms_sorted = sorted(rooms, key=lambda r: r["area"])
+
+    for room in rooms_sorted:
+        bbox = room["_bbox"]
+        verts = room["vertices"]
+
+        space_id = ""
+        for t in candidate_texts:
+            tx, ty = t["x"], t["y"]
+            if not (bbox[0] <= tx <= bbox[2] and bbox[1] <= ty <= bbox[3]):
+                continue
+            if t["text"].strip() in used_space_ids:
+                continue
+            if point_in_polygon(tx, ty, verts):
+                space_id = t["text"].strip()
+                used_space_ids.add(space_id)
+                break
+        if not space_id:
+            space_id = f"S{len(results) + 1}"
+
+        contained = []
+        for h in hatches:
+            cx, cy = h["cx"], h["cy"]
+            if not (bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]):
+                continue
+            if point_in_polygon(cx, cy, verts):
+                contained.append(h)
+
+        pat_totals = {}
+        for h in contained:
+            pat = h["pattern"]
+            pat_totals[pat] = pat_totals.get(pat, 0.0) + h["area"]
+
+        gi1 = 0.0
+        best_area = 0.0
+        best_mat = ""
+        for pat, ar in pat_totals.items():
+            mat_name, has_green = pattern_map.get(pat, ("一般材料", False))
+            if has_green:
+                gi1 += ar
+            if ar > best_area:
+                best_area = ar
+                best_mat = mat_name
+        if not best_mat:
+            best_mat = "矽酸鈣天花板"
+
+        ai1 = room["area"]
+        li = room["length"]
+        ai4 = ai1
+        ai2 = ai4 * k_default * h2_default
+
+        results.append({
+            "space_id": space_id,
+            "Ai1": ai1, "Li": li,
+            "k": k_default, "H2": h2_default,
+            "Ai4": ai4, "Ai2": ai2,
+            "Gi1": gi1, "Gi4": 0.0,
+            "ceiling_material": best_mat,
+            "wall_material": "乳膠漆",
+            "_pattern_breakdown": pat_totals,
+        })
+
+    def _sort_key(r):
+        sid = r["space_id"]
+        try:
+            return (0, int(sid))
+        except ValueError:
+            return (1, sid)
+    results.sort(key=_sort_key)
+    return results
 
 
 # ─────────────────────────────────────────────────────────
@@ -2002,8 +2167,10 @@ class GreenBuildingApp(tk.Tk):
         try:
             dump_path = connect_and_dump(self.dwg_path, lambda m: self.after(0, lambda: self._log(m)))
             self.after(0, lambda: self._log("解析資料中...", "info"))
-            blocks, texts = parse_dump(dump_path)
-            self.after(0, lambda: self._log(f"  {len(blocks)} 個圖塊, {len(texts)} 個文字", "info"))
+            blocks, texts, polylines, hatches = parse_dump(dump_path)
+            self.after(0, lambda: self._log(
+                f"  {len(blocks)} 圖塊 / {len(texts)} 文字 / "
+                f"{len(polylines)} 封閉聚合線 / {len(hatches)} 剖面線", "info"))
 
             info = extract_project_info(blocks, texts)
             wins = extract_windows(blocks, texts)
@@ -2044,14 +2211,22 @@ class GreenBuildingApp(tk.Tk):
                 self.after(0, lambda p=p: self._log(
                     f"    {p['name']} ({p['catalog']}) {p['area']} m2", "info"))
 
-            # Load green materials CSV from DWG folder (if exists)
+            # ── Green materials: CSV override > auto-detection ──
             green_materials = []
+            gm_source = ""
             if self.dwg_path:
                 gm_csv = os.path.join(os.path.dirname(self.dwg_path), "green_materials.csv")
                 green_materials = extract_green_materials(gm_csv)
+                if green_materials:
+                    gm_source = "CSV 覆蓋"
+            if not green_materials:
+                green_materials = detect_green_materials_auto(polylines, hatches, texts)
+                if green_materials:
+                    gm_source = "自動偵測"
+
             if green_materials:
                 self.after(0, lambda: self._log(
-                    f"\n  綠建材: {len(green_materials)} 個空間（從 green_materials.csv 載入）", "good"))
+                    f"\n  綠建材: {len(green_materials)} 個空間（{gm_source}）", "good"))
                 sum_a1 = sum(g["Ai1"] for g in green_materials)
                 sum_a2 = sum(g["Ai2"] for g in green_materials)
                 sum_gi1 = sum(g["Gi1"] for g in green_materials)
@@ -2060,9 +2235,17 @@ class GreenBuildingApp(tk.Tk):
                     f"    Σ天花板 {sum_a1:.2f} m²  Σ內部裝修 {sum_a2:.2f} m²", "info"))
                 self.after(0, lambda: self._log(
                     f"    Σ天花綠建材 {sum_gi1:.2f} m²  Σ牆面綠建材 {sum_gi4:.2f} m²", "info"))
+                show_max = 8
+                for g in green_materials[:show_max]:
+                    self.after(0, lambda g=g: self._log(
+                        f"    {g['space_id']:>5}: Ai,1={g['Ai1']:.2f}  Gi1={g['Gi1']:.2f}  "
+                        f"({g['ceiling_material']})", "info"))
+                if len(green_materials) > show_max:
+                    self.after(0, lambda: self._log(
+                        f"    ... 還有 {len(green_materials) - show_max} 個空間", "info"))
             else:
                 self.after(0, lambda: self._log(
-                    "\n  綠建材: 未找到 green_materials.csv（用 GBM LISP 產出後放到 DWG 同資料夾）", "warn"))
+                    "\n  綠建材: 未偵測到（圖面無封閉聚合線 + HATCH，或 CSV 也沒有）", "warn"))
 
             self.after(0, lambda: self._log("\n組裝 GBF 檔案中...", "info"))
 
