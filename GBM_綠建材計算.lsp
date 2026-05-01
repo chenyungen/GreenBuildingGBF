@@ -4,7 +4,8 @@
 ;;; ============================================================
 ;;;  指令
 ;;;    GBM            顯示指令選單
-;;;    GBM-ADD        從封閉線自動擷取面積／周長，新增一個空間
+;;;    GBM-AUTO       【自動】掃描所有房間 + HATCH，一次算完綠建材  ★
+;;;    GBM-ADD        手動：從封閉線自動擷取面積／周長，新增一個空間
 ;;;    GBM-HATCH      由剖面線 (HATCH) 統計綠建材面積
 ;;;    GBM-LIST       列出所有已記錄空間
 ;;;    GBM-EDIT       修改特定空間的綠建材面積
@@ -13,6 +14,7 @@
 ;;;    GBM-EXPORT     匯出為 CSV (給 GreenBuildingGBF.exe 讀取)
 ;;;    GBM-TABLE      在圖面上繪製計算表格
 ;;;    GBM-LOAD       從現有 CSV 載回資料
+;;;    GBM-MAP        檢視/編輯剖面線圖案 → 材料對應表
 ;;; ============================================================
 
 (vl-load-com)
@@ -21,12 +23,22 @@
 (if (not *GBM-DATA*) (setq *GBM-DATA* '()))
 (if (not *GBM-H2*)   (setq *GBM-H2*   2.8))  ; default ceiling height
 (if (not *GBM-K*)    (setq *GBM-K*    0.8))  ; default k
+
+;; Pattern → material mapping. Format: (pattern_name material_name has_green_mark)
+;; T = 具綠建材標章; nil = 一般材料
 (if (not *GBM-PATTERN-MAP*)
   (setq *GBM-PATTERN-MAP* '(
-    ("ANSI31" . "乳膠漆")
-    ("AR-HBONE" . "矽酸鈣天花板")
-    ("NET" . "矽酸鈣天花板")
-    ("GRASS" . "乳膠漆")
+    ("ANSI31"     "乳膠漆"           T)
+    ("ANSI32"     "乳膠漆"           T)
+    ("AR-HBONE"   "矽酸鈣天花板"     T)
+    ("AR-PARQ1"   "矽酸鈣天花板"     T)
+    ("NET"        "矽酸鈣天花板"     T)
+    ("CROSS"      "乳膠漆"           T)
+    ("SQUARE"     "矽酸鈣天花板"     T)
+    ("GRASS"      "乳膠漆"           T)
+    ("DOTS"       "一般材料"         nil)
+    ("AR-CONC"    "混凝土"           nil)
+    ("SOLID"      "一般材料"         nil)
   )))
 
 ;;; ------------------ Helpers ------------------
@@ -60,6 +72,108 @@
   (setq *GBM-DATA*
     (mapcar '(lambda (r) (if (equal (nth 0 r) id) new-rec r))
             *GBM-DATA*)))
+
+;; ----- Geometry helpers for AUTO mode -----
+
+(defun gbm:sample-curve (poly n / ep i tt pt result)
+  "沿曲線取 n 個等參數點，回傳點清單（供 _WP 使用）。"
+  (setq ep (vlax-curve-getEndParam poly))
+  (cond
+    ((null ep) nil)
+    (T
+      (setq result '() i 0)
+      (while (< i n)
+        (setq tt (* (/ i (float n)) ep))
+        (setq pt (vl-catch-all-apply 'vlax-curve-getPointAtParam (list poly tt)))
+        (if (and (not (vl-catch-all-error-p pt)) pt)
+          (setq result (cons (list (car pt) (cadr pt) 0.0) result)))
+        (setq i (1+ i)))
+      (reverse result))))
+
+(defun gbm:is-numeric-string (s / i n c valid)
+  "字串是否全為數字（允許 1-4 位）"
+  (cond
+    ((or (null s) (= s "")) nil)
+    (T
+      (setq i 1 n (strlen s) valid T)
+      (while (and valid (<= i n))
+        (setq c (ascii (substr s i 1)))
+        (if (or (< c 48) (> c 57)) (setq valid nil))
+        (setq i (1+ i)))
+      (and valid (>= n 1) (<= n 6)))))
+
+(defun gbm:strip-mtext (s / clean i n c skip)
+  "簡單清除 MTEXT 控制碼（{...} \\X; 等）"
+  (if (or (null s) (= s "")) (setq s ""))
+  (setq clean "" i 1 n (strlen s) skip 0)
+  (while (<= i n)
+    (setq c (substr s i 1))
+    (cond
+      ((= c "{") (setq skip (1+ skip)))
+      ((= c "}") (setq skip (max 0 (1- skip))))
+      ((and (= c "\\") (<= (+ i 1) n))
+        ;; skip escape sequences like \X; \pxq...; etc.
+        (setq i (1+ i))
+        (while (and (<= i n) (not (= (substr s i 1) ";")))
+          (setq i (1+ i))))
+      ((= skip 0) (setq clean (strcat clean c))))
+    (setq i (1+ i)))
+  (vl-string-trim " \t\r\n" clean))
+
+(defun gbm:find-space-id-for-room (room / pts ss i ent ed txt found)
+  "在房間內尋找代表空間編號的數字文字。"
+  (setq pts (gbm:sample-curve room 24))
+  (setq found nil)
+  (cond
+    ((or (null pts) (< (length pts) 3)) "")
+    (T
+      (if (setq ss (ssget "_WP" pts '((0 . "TEXT,MTEXT"))))
+        (progn
+          (setq i 0)
+          (while (and (not found) (< i (sslength ss)))
+            (setq ent (ssname ss i))
+            (setq ed (entget ent))
+            (setq txt (gbm:strip-mtext (cdr (assoc 1 ed))))
+            (if (gbm:is-numeric-string txt) (setq found txt))
+            (setq i (1+ i)))))
+      (if found found ""))))
+
+(defun gbm:hatches-in-room (room / pts ss results i)
+  "回傳房間封閉線範圍內的 HATCH entity 名稱清單。"
+  (setq pts (gbm:sample-curve room 24))
+  (setq results '())
+  (cond
+    ((or (null pts) (< (length pts) 3)) nil)
+    (T
+      (if (setq ss (ssget "_WP" pts '((0 . "HATCH"))))
+        (progn
+          (setq i 0)
+          (while (< i (sslength ss))
+            (setq results (cons (ssname ss i) results))
+            (setq i (1+ i)))))))
+  results)
+
+(defun gbm:lookup-pattern (pat / m)
+  "回傳 (材料名 是否綠建材)。沒對照就視為一般材料。"
+  (setq m (assoc pat *GBM-PATTERN-MAP*))
+  (cond
+    ((null m) (list "一般材料" nil))
+    ;; old dotted-pair fallback: ("ANSI31" . "乳膠漆")
+    ((not (listp (cdr m))) (list (cdr m) T))
+    ;; new format: (pattern material green?)
+    (T (list (cadr m) (caddr m)))))
+
+(defun gbm:closed-polyline-p (e / et closed)
+  "Check if entity is a closed polyline."
+  (cond
+    ((null e) nil)
+    (T
+      (setq et (entget e))
+      (setq closed (cdr (assoc 70 et)))
+      (or (and closed (= 1 (logand 1 closed)))
+          ;; for POLYLINE, also bit 1 of group 70
+          ;; or area > 0 indicates closed-ish
+          (and (gbm:area e) (> (gbm:area e) 0.01))))))
 
 ;;; ------------------ GBM-ADD ------------------
 
@@ -110,7 +224,7 @@
 ;;; ------------------ GBM-HATCH ------------------
 ;;; Select multiple hatches, group by pattern, show total area per pattern.
 
-(defun c:GBM-HATCH ( / ss i ent obj pat ar key found data)
+(defun c:GBM-HATCH ( / ss i ent obj pat ar key found data mat-info p)
   (princ "\n=== GBM-HATCH 剖面線面積統計 ===")
   (princ "\n選擇剖面線 (HATCH) 物件 (可多選):")
   (setq ss (ssget '((0 . "HATCH"))))
@@ -133,16 +247,125 @@
               (setq data (subst (cons key (+ (cdr found) ar)) found data))
               (setq data (append data (list (cons key ar)))))))
         (setq i (1+ i)))
-      (princ "\n\n  剖面圖案          總面積 (m²)   對應材料")
-      (princ "\n  ─────────────────────────────────────────")
+      (princ "\n\n  剖面圖案          總面積 (m²)   對應材料                    綠建材")
+      (princ "\n  ──────────────────────────────────────────────────────────")
       (foreach p data
+        (setq mat-info (gbm:lookup-pattern (car p)))
         (princ (strcat "\n  "
           (substr (strcat (car p) "                ") 1 16)
-          (gbm:fmt (cdr p) 3)
-          "       "
-          (cond ((cdr (assoc (car p) *GBM-PATTERN-MAP*)))
-                (T "（未定義，見 *GBM-PATTERN-MAP*）")))))
+          (gbm:fmt (cdr p) 3) "      "
+          (substr (strcat (car mat-info) "                        ") 1 24)
+          (if (cadr mat-info) "✔" "—"))))
       (princ "\n")))
+  (princ))
+
+;;; ------------------ GBM-AUTO ★ 全自動 ------------------
+;;; 一次掃描多個房間 + 房間內的剖面線，自動算出綠建材分佈
+
+(defun c:GBM-AUTO ( / ss-rooms n i room ai1 li sid hatches
+                     pat-totals h-ent h-obj h-pat h-area
+                     mat-info gi1 best-area best-mat pair found
+                     ai4 ai2 rec processed skipped)
+  (princ "\n========== GBM-AUTO 自動偵測綠建材 ==========")
+  (princ "\n步驟 1/2  選取所有房間邊界（封閉聚合線）")
+  (princ "\n          可框選整層平面圖；非封閉的物件會自動略過")
+  (setq ss-rooms (ssget '((0 . "LWPOLYLINE,POLYLINE"))))
+  (cond
+    ((null ss-rooms) (princ "\n取消。"))
+    (T
+      (setq n (sslength ss-rooms) i 0 processed 0 skipped 0)
+      (princ (strcat "\n步驟 2/2  分析 " (itoa n) " 個物件...\n"))
+      (setq *GBM-DATA* '())
+      (while (< i n)
+        (setq room (ssname ss-rooms i))
+        (setq ai1 (gbm:area room))
+        (cond
+          ;; Skip non-closed or tiny polylines
+          ((or (null ai1) (< ai1 0.5))
+            (setq skipped (1+ skipped)))
+          (T
+            (setq li (gbm:length room))
+            (setq sid (gbm:find-space-id-for-room room))
+            (if (= sid "") (setq sid (itoa (1+ processed))))
+            ;; Aggregate hatch areas by pattern within room
+            (setq hatches (gbm:hatches-in-room room))
+            (setq pat-totals '())
+            (foreach h-ent hatches
+              (setq h-obj (vlax-ename->vla-object h-ent))
+              (setq h-pat (vl-catch-all-apply 'vlax-get-property (list h-obj 'PatternName)))
+              (setq h-area (vl-catch-all-apply 'vlax-get-property (list h-obj 'Area)))
+              (if (and (not (vl-catch-all-error-p h-pat))
+                       (not (vl-catch-all-error-p h-area))
+                       (numberp h-area))
+                (progn
+                  (setq found (assoc h-pat pat-totals))
+                  (if found
+                    (setq pat-totals
+                      (subst (cons h-pat (+ (cdr found) h-area)) found pat-totals))
+                    (setq pat-totals
+                      (append pat-totals (list (cons h-pat h-area))))))))
+            ;; Compute Gi1 (sum of green-marked patterns) and dominant material
+            (setq gi1 0 best-area 0 best-mat "")
+            (foreach pair pat-totals
+              (setq mat-info (gbm:lookup-pattern (car pair)))
+              (if (cadr mat-info) (setq gi1 (+ gi1 (cdr pair))))
+              (if (> (cdr pair) best-area)
+                (progn (setq best-area (cdr pair))
+                       (setq best-mat (car mat-info)))))
+            (if (= best-mat "") (setq best-mat "矽酸鈣天花板"))
+            ;; Build record
+            (setq ai4 ai1)
+            (setq ai2 (* ai4 *GBM-K* *GBM-H2*))
+            (setq rec (list sid ai1 li *GBM-K* *GBM-H2* ai2 gi1 0 best-mat "乳膠漆" ai4))
+            (setq *GBM-DATA* (append *GBM-DATA* (list rec)))
+            (setq processed (1+ processed))
+            (princ (strcat "\n  "
+              (substr (strcat sid "      ") 1 6)
+              "Ai,1=" (gbm:fmt ai1 2) "  "
+              "Gi1=" (gbm:fmt gi1 2) "  "
+              "(" (itoa (length pat-totals)) " 種剖面)  → "
+              best-mat))))
+        (setq i (1+ i)))
+      (princ (strcat "\n\n✔ 完成: " (itoa processed) " 個房間  ("
+                     (itoa skipped) " 個非封閉物件略過)"))
+      (princ "\n  GBM-LIST   檢視全部結果")
+      (princ "\n  GBM-EDIT   調整個別空間")
+      (princ "\n  GBM-EXPORT 匯出 CSV (給應用程式)")))
+  (princ))
+
+;;; ------------------ GBM-MAP 圖案-材料對應表 ------------------
+
+(defun c:GBM-MAP ( / cmd pat mat green entry)
+  (princ "\n=== 剖面線圖案 → 材料 對應表 ===")
+  (foreach m *GBM-PATTERN-MAP*
+    (princ (strcat "\n  "
+      (substr (strcat (car m) "                ") 1 16)
+      "→ "
+      (substr (strcat (cadr m) "                        ") 1 22)
+      (if (caddr m) "  ✔ 綠建材" "  — 一般"))))
+  (princ "\n  ─────────────────────────────────────────")
+  (initget "Add Remove Quit")
+  (setq cmd (getkword "\n[Add 新增 / Remove 刪除 / Quit 離開] <Quit>: "))
+  (cond
+    ((or (null cmd) (= cmd "Quit"))
+      (princ "\n離開。"))
+    ((= cmd "Add")
+      (setq pat (getstring T "\n剖面圖案名稱 (例 ANSI31): "))
+      (setq mat (getstring T "\n材料名稱 (例 矽酸鈣天花板): "))
+      (initget "Yes No")
+      (setq green (getkword "\n具綠建材標章? [Yes/No] <Yes>: "))
+      (if (null green) (setq green "Yes"))
+      (setq entry (list pat mat (= green "Yes")))
+      ;; Replace if exists, else append
+      (setq *GBM-PATTERN-MAP*
+        (vl-remove-if '(lambda (m) (equal (car m) pat)) *GBM-PATTERN-MAP*))
+      (setq *GBM-PATTERN-MAP* (append *GBM-PATTERN-MAP* (list entry)))
+      (princ (strcat "\n✔ 已加入 " pat " → " mat)))
+    ((= cmd "Remove")
+      (setq pat (getstring T "\n要刪除的圖案名稱: "))
+      (setq *GBM-PATTERN-MAP*
+        (vl-remove-if '(lambda (m) (equal (car m) pat)) *GBM-PATTERN-MAP*))
+      (princ (strcat "\n✔ 已刪除 " pat))))
   (princ))
 
 ;;; ------------------ GBM-LIST ------------------
@@ -353,9 +576,11 @@
 ;;; ------------------ GBM (help) ------------------
 
 (defun c:GBM ()
-  (princ "\n========== 綠建材計算工具 ==========")
-  (princ "\n  GBM-ADD       新增空間（選封閉線自動抓面積／周長）")
-  (princ "\n  GBM-HATCH     統計剖面線（HATCH）面積")
+  (princ "\n══════════ 綠建材計算工具 ══════════")
+  (princ "\n  ★ GBM-AUTO    全自動：掃描整層房間 + 剖面線")
+  (princ "\n──────────────────────────────────────")
+  (princ "\n  GBM-ADD       手動新增單一空間")
+  (princ "\n  GBM-HATCH     統計選取剖面線面積")
   (princ "\n  GBM-LIST      列出所有空間 + 總計")
   (princ "\n  GBM-EDIT      修改綠建材比例")
   (princ "\n  GBM-DELETE    刪除空間")
@@ -363,8 +588,10 @@
   (princ "\n  GBM-EXPORT    匯出 CSV (給 GreenBuildingGBF.exe)")
   (princ "\n  GBM-LOAD      從 CSV 載回資料")
   (princ "\n  GBM-TABLE     在圖面上繪製檢討表")
-  (princ "\n======================================")
-  (princ (strcat "\n目前已記錄 " (itoa (length *GBM-DATA*)) " 個空間"))
+  (princ "\n  GBM-MAP       檢視/編輯圖案 → 材料對照表")
+  (princ "\n══════════════════════════════════════")
+  (princ (strcat "\n目前 " (itoa (length *GBM-DATA*)) " 個空間 / "
+                 (itoa (length *GBM-PATTERN-MAP*)) " 種圖案對應"))
   (princ))
 
 (princ "\n[GBM 綠建材 LISP 已載入]  輸入 GBM 查看指令")
